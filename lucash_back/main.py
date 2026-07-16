@@ -1,20 +1,67 @@
 import os
+import json
 import telebot
+import threading # NUEVO: Para correr procesos en paralelo
+import time 
+from flask import Flask # NUEVO: Para crear el servidor web ligero
 from telebot import types
-import config
-import db
-import ai
+from datetime import datetime
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types as genai_types
+from supabase import create_client, Client
 
-bot = telebot.TeleBot(config.TELEGRAM_TOKEN)
+# 1. Cargar Variables de Entorno
+load_dotenv()
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+G_KEY = os.getenv("GEMINI_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Registro automático de comandos
+if not all([TOKEN, G_KEY, SUPABASE_URL, SUPABASE_KEY]):
+    print("❌ ERROR: Faltan llaves en tu archivo .env")
+    exit()
+
+# 2. Inicializar Clientes
+client = genai.Client(api_key=G_KEY)
+MODEL_ID = 'gemini-3.1-flash-lite'
+bot = telebot.TeleBot(TOKEN)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ==========================================
+# 🔌 SERVIDOR WEB KEEPALIVE (FLASK)
+# ==========================================
+# Creamos una mini página web que responde con un mensaje de "vivo".
+server = Flask('')
+
+@server.route('/')
+def home():
+    return "🔋 Lucash Bot está en línea y funcionando 24/7!"
+
+def run_server():
+    # Render asigna automáticamente un puerto dinámico en la variable de entorno 'PORT'
+    port = int(os.environ.get("PORT", 8080))
+    server.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    """Inicia el servidor web en un hilo secundario en segundo plano"""
+    t = threading.Thread(target=run_server)
+    t.start()
+# ==========================================
+
+COMANDOS_INFO = {
+    "start": "Iniciar conversación y saludo de Lucash",
+    "help": "Ver la lista de comandos disponibles",
+    "resumen": "Ver balance y desglose de gastos de este mes",
+    "mi_id": "Obtener tu ID de Telegram para vincular la web"
+}
+
 def registrar_menu_comandos():
-    # Ahora lee de forma segura desde config.py porque ya está declarada allí
-    comandos = [types.BotCommand(cmd, desc) for cmd, desc in config.COMANDOS_INFO.items()]
+    comandos = [types.BotCommand(cmd, desc) for cmd, desc in COMANDOS_INFO.items()]
     bot.set_my_commands(comandos)
     print("📋 Menú de comandos actualizado en Telegram.")
 
-# handlers de Telegram
+# COMANDOS: Bienvenida y Ayuda
 @bot.message_handler(commands=['start', 'help'])
 def send_help(message):
     nombre = message.from_user.first_name
@@ -23,11 +70,12 @@ def send_help(message):
     mensaje = f"👋 ¡Hola {nombre}! Soy Lucash, tu asistente de bolsillo.\n\n"
     mensaje += f"🔑 Tu ID de Telegram es: <code>{user_id}</code> (usaló para vincular la web).\n\n"
     mensaje += "Aquí tienes las herramientas disponibles en mi menú:\n\n"
-    for cmd, desc in config.COMANDOS_INFO.items():
+    for cmd, desc in COMANDOS_INFO.items():
         mensaje += f"🔹 /{cmd} - {desc}\n"
-    mensaje += "\n💡 Escríbeme o <b>mándame una nota de voz</b> con lo que gastas."
+    mensaje += "\n💡 Escríbeme o *mándame una nota de voz* con lo que gastas."
     bot.reply_to(message, mensaje, parse_mode='HTML')
 
+# COMANDO: Resumen mensual
 @bot.message_handler(commands=['resumen'])
 def enviar_resumen(message):
     user_id = message.from_user.id
@@ -69,17 +117,16 @@ def enviar_resumen(message):
         print(f"❌ Error al generar reporte: {e}")
         bot.reply_to(message, "Perdón, tuve un problema al sumar tus números.")
 
-
+# COMANDO: Obtener ID para vinculación web
 @bot.message_handler(commands=['mi_id'])
 def enviar_id_usuario(message):
     user_id = message.from_user.id
-    
     mensaje = f"🔑 <b>Tu ID de Sincronización</b>\n\n"
     mensaje += f"Tu ID es: <code>{user_id}</code>\n\n"
     mensaje += "Copia este número (con solo tocarlo se copia) y pegalo en el Dashboard de la web para ver tus gastos."
-    
     bot.reply_to(message, mensaje, parse_mode='HTML')
 
+# MANEJADOR: Eliminar gasto (Botón interactivo)
 @bot.callback_query_handler(func=lambda call: call.data.startswith('del_'))
 def callback_eliminar_gasto(call):
     transaccion_id = int(call.data.split('_')[1])
@@ -96,6 +143,7 @@ def callback_eliminar_gasto(call):
         print(f"❌ Error al eliminar registro: {e}")
         bot.answer_callback_query(call.id, "No se pudo eliminar el gasto.")
 
+# MANEJADOR: Notas de voz (Audio)
 @bot.message_handler(content_types=['voice'])
 def handle_voice_message(message):
     user_id = message.from_user.id
@@ -113,11 +161,9 @@ def handle_voice_message(message):
         bot.send_chat_action(message.chat.id, 'typing')
         datos_json = ai.analizar_audio(temp_filename)
         
-        # Leemos la lista de transacciones y la respuesta
         lista_transacciones = datos_json.get("transacciones", [])
         respuesta_usuario = datos_json.get("respuesta_usuario", "¡Entendido!")
 
-        # Si hay transacciones extraídas, las guardamos una por una en Supabase
         if lista_transacciones:
             for t in lista_transacciones:
                 monto = t.get("monto")
@@ -129,9 +175,8 @@ def handle_voice_message(message):
                         categoria=t.get("categoria"),
                         tipo=t.get("tipo", "gasto")
                     )
-            print(f"💾 Guardadas {len(lista_transacciones)} transacciones desde audio exitosamente.")
+            print(f"💾 Guardadas {len(lista_transacciones)} transacciones desde audio.")
         
-        # Respondemos al usuario con la confirmación de la IA
         bot.reply_to(message, respuesta_usuario)
             
     except Exception as e:
@@ -142,8 +187,7 @@ def handle_voice_message(message):
             os.remove(temp_filename)
             print("🧹 Archivo temporal local eliminado.")
 
-
-# MODIFICACIÓN EN MANEJADOR DE TEXTO GENERAL
+# MANEJADOR: Texto general
 @bot.message_handler(func=lambda message: True)
 def handle_all_messages(message):
     user_id = message.from_user.id
@@ -153,11 +197,9 @@ def handle_all_messages(message):
         bot.send_chat_action(message.chat.id, 'typing')
         datos_json = ai.analizar_texto(message.text)
         
-        # Leemos la lista de transacciones y la respuesta
         lista_transacciones = datos_json.get("transacciones", [])
         respuesta_usuario = datos_json.get("respuesta_usuario", "¡Entendido!")
 
-        # Si hay transacciones extraídas, las guardamos una por una en Supabase
         if lista_transacciones:
             for t in lista_transacciones:
                 monto = t.get("monto")
@@ -169,7 +211,7 @@ def handle_all_messages(message):
                         categoria=t.get("categoria"),
                         tipo=t.get("tipo", "gasto")
                     )
-            print(f"💾 Guardadas {len(lista_transacciones)} transacciones desde texto exitosamente.")
+            print(f"💾 Guardadas {len(lista_transacciones)} transacciones desde texto.")
         
         bot.reply_to(message, respuesta_usuario)
         
@@ -177,7 +219,27 @@ def handle_all_messages(message):
         print(f"❌ Error al procesar: {e}")
         bot.reply_to(message, "Perdón, tuve un problema al anotar eso. ¿Me lo repetís?")
 
+import db
+import ai
+
 if __name__ == "__main__":
+    # 1. Iniciamos el servidor de Flask en segundo plano
+    keep_alive()
+    
+    # 2. Registramos los comandos del menú
     registrar_menu_comandos()
-    print("✅ Lucash está en línea con arquitectura modular.")
-    bot.polling(non_stop=True)
+    
+    print("✅ Lucash está en línea con keep-alive activo.")
+    
+    # 3. Bucle infinito de reconexión automática en caso de caída de Telegram o Internet
+    while True:
+        try:
+            print("🔌 Conectando con los servidores de Telegram...")
+            # Iniciamos el polling con un timeout controlado
+            bot.polling(non_stop=True, interval=0, timeout=20)
+        except Exception as e:
+            # Si Telegram da un error 502, 504 o se cae tu internet, el programa no se detiene.
+            # Imprime el error, espera 5 segundos y vuelve a intentar conectarse automáticamente.
+            print(f"⚠️ Conexión perdida con Telegram: {e}")
+            print("🔄 Reintentando conexión automática en 5 segundos...")
+            time.sleep(5)
